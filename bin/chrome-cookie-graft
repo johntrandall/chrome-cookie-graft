@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""
+chrome-cookie-graft — copy session cookies between Chrome profiles on one Mac.
+
+Chrome Sync never syncs cookies, so profiles signed into the same Google account
+share bookmarks, history and extensions but each keep an isolated cookie jar.
+This copies the jar from one profile into others so a login does not have to be
+repeated per profile — while holding back whatever you name in `protect`, so
+each target keeps its own identity for those sites.
+
+Cookies are copied as ciphertext. Chrome's "Chrome Safe Storage" Keychain key is
+per-application, not per-profile, so blobs written by one profile decrypt in
+another on the same machine. Nothing is decrypted here and no Keychain access is
+needed. Only <Profile>/Cookies is ever opened.
+
+Config: ~/.config/chrome-cookie-graft/config.json  (see config.example.json)
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+
+CHROME_DIR = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+CONFIG = os.path.expanduser("~/.config/chrome-cookie-graft/config.json")
+STATE = os.path.expanduser("~/.local/state/chrome-cookie-graft/state.json")
+
+COLS = ("creation_utc,host_key,top_frame_site_key,name,value,encrypted_value,path,"
+        "expires_utc,is_secure,is_httponly,last_access_utc,has_expires,is_persistent,"
+        "priority,samesite,source_scheme,source_port,last_update_utc,source_type,"
+        "has_cross_site_ancestor")
+CL = COLS.split(",")
+KEY_COLS = ["host_key", "top_frame_site_key", "has_cross_site_ancestor",
+            "name", "path", "source_scheme", "source_port"]
+
+DEFAULTS = {
+    "source": "Default",
+    "targets": [],
+    "only": [],
+    "protect": ["claude.ai", "*.claude.ai", "claude.com", "*.claude.com",
+                "anthropic.com", "*.anthropic.com", "chrome-extension://*"],
+    "exclude": [],
+    "stale_days": 3,
+    "keep_backups": 5,
+}
+
+
+# ---------------------------------------------------------------- config ----
+
+def load_config(path):
+    if not os.path.exists(path):
+        sys.exit(f"No config at {path}\n"
+                 f"Copy config.example.json there and edit it, or run with --source/--to.")
+    try:
+        raw = json.load(open(path))
+    except ValueError as e:
+        sys.exit(f"{path} is not valid JSON: {e}")
+    cfg = dict(DEFAULTS)
+    unknown = set(raw) - set(DEFAULTS)
+    if unknown:
+        sys.exit(f"{path}: unknown key(s) {sorted(unknown)}; valid keys are {sorted(DEFAULTS)}")
+    cfg.update(raw)
+    for k in ("targets", "only", "protect", "exclude"):
+        if not isinstance(cfg[k], list):
+            sys.exit(f"{path}: '{k}' must be a list")
+    if not cfg["targets"]:
+        sys.exit(f"{path}: 'targets' is empty — nothing to graft into")
+    if cfg["source"] in cfg["targets"]:
+        sys.exit(f"{path}: source {cfg['source']!r} is also a target; that would be a no-op loop")
+    return cfg
+
+
+def matches(host, patterns):
+    """Glob match, case-insensitive. '*.example.com' also matches '.example.com',
+    which is how Chrome spells a domain cookie."""
+    h = host.lower()
+    for p in patterns:
+        p = p.lower()
+        if fnmatch.fnmatch(h, p):
+            return True
+        if p.startswith("*.") and h == p[1:]:
+            return True
+    return False
+
+
+# ----------------------------------------------------------------- utils ----
+
+def cookie_db(profile, base=None):
+    """Chrome 154 keeps Cookies at the profile root; older builds used Network/Cookies."""
+    for c in (os.path.join(base or CHROME_DIR, profile, "Cookies"),
+              os.path.join(base or CHROME_DIR, profile, "Network", "Cookies")):
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def is_locked(path):
+    """True if Chrome currently has this profile loaded. Writing under a loaded
+    profile is pointless: Chrome flushes its in-memory jar over us on exit."""
+    return subprocess.run(["lsof", path], capture_output=True).returncode == 0
+
+
+def protected_rows(conn, protect):
+    rows = conn.execute("SELECT %s FROM cookies ORDER BY host_key,name,path" % COLS).fetchall()
+    return [r for r in rows if matches(r[1], protect)]
+
+
+def protected_fingerprint(conn, protect):
+    rows = protected_rows(conn, protect)
+    h = hashlib.sha256()
+    for r in rows:
+        for v in r:
+            h.update(repr(v).encode())
+    return len(rows), h.hexdigest()[:16]
+
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    json.dump(st, open(STATE, "w"), indent=2, sort_keys=True)
+
+
+def prune_backups(db, keep):
+    d, base = os.path.dirname(db), os.path.basename(db) + ".bak-"
+    old = sorted(f for f in os.listdir(d) if f.startswith(base))
+    for f in old[:max(0, len(old) - keep)]:
+        os.unlink(os.path.join(d, f))
+
+
+# ------------------------------------------------------------------ main ----
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    ap.add_argument("targets", nargs="*", help="profiles to graft into (default: config targets)")
+    ap.add_argument("-c", "--config", default=CONFIG)
+    ap.add_argument("--source", help="override config source profile")
+    ap.add_argument("-n", "--dry-run", action="store_true")
+    ap.add_argument("--only", action="append", default=None,
+                    help="copy ONLY hosts matching this glob (repeatable); overrides config 'only'")
+    ap.add_argument("--replace-all", action="store_true",
+                    help="overwrite destination rows even when newer (default: newer-only)")
+    ap.add_argument("--chrome-dir", help="override Chrome data dir (testing)")
+    ap.add_argument("--print-config", action="store_true")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    if args.source:
+        cfg["source"] = args.source
+    if args.targets:
+        cfg["targets"] = args.targets
+    if args.only is not None:
+        cfg["only"] = args.only
+    if args.print_config:
+        print(json.dumps(cfg, indent=2, sort_keys=True))
+        return 0
+
+    base = args.chrome_dir
+    src_db = cookie_db(cfg["source"], base)
+    if not src_db:
+        sys.exit("No Cookies DB for source profile %r" % cfg["source"])
+
+    # Snapshot the source; never open the live file for write.
+    snap = "/tmp/cookie-graft-src-%d.db" % os.getpid()
+    shutil.copy2(src_db, snap)
+    s = sqlite3.connect(snap)
+    allrows = s.execute("SELECT %s FROM cookies" % COLS).fetchall()
+    s.close()
+    os.unlink(snap)
+
+    # Selection order matters: protect ALWAYS wins, even over an explicit `only`
+    # allowlist. An allowlist must never be able to un-protect an identity host.
+    rows = []
+    for r in allrows:
+        host = r[1]
+        if matches(host, cfg["protect"]):
+            continue
+        if cfg["only"]:
+            if matches(host, cfg["only"]):
+                rows.append(r)
+            continue
+        if matches(host, cfg["exclude"]):
+            continue
+        rows.append(r)
+
+    leaked = sorted({r[1] for r in rows if matches(r[1], cfg["protect"])})
+    if leaked:
+        sys.exit("ABORT: protected hosts present in selection: %s" % leaked)
+
+    mode = ("only %s" % cfg["only"]) if cfg["only"] else "all but exclude list"
+    print("source %s: %d cookies / %d hosts selected (%s)"
+          % (cfg["source"], len(rows), len({r[1] for r in rows}), mode))
+
+    ki = [CL.index(c) for c in KEY_COLS]
+    lui = CL.index("last_update_utc")
+    rc, state = 0, load_state()
+
+    for dst in cfg["targets"]:
+        db = cookie_db(dst, base)
+        if not db:
+            print("  %s: SKIP — no Cookies DB" % dst); rc = max(rc, 1); continue
+        if is_locked(db):
+            print("  %s: SKIP — open in Chrome (close it and re-run)" % dst); rc = max(rc, 1); continue
+
+        d = sqlite3.connect(db)
+        before = d.execute("SELECT count(*) FROM cookies").fetchone()[0]
+        pn0, ph0 = protected_fingerprint(d, cfg["protect"])
+
+        if args.replace_all:
+            todo = rows
+        else:
+            have = {tuple(r[:-1]): r[-1] for r in d.execute(
+                "SELECT %s,last_update_utc FROM cookies" % ",".join(KEY_COLS))}
+            todo = [r for r in rows if have.get(tuple(r[i] for i in ki), -1) < r[lui]]
+
+        if args.dry_run:
+            print("  %s: would write %d of %d rows (%d now, %d protected held)"
+                  % (dst, len(todo), len(rows), before, pn0))
+            d.close(); continue
+
+        d.close()
+        backup = "%s.bak-%s" % (db, time.strftime("%Y%m%d-%H%M%S"))
+        shutil.copy2(db, backup)
+
+        d = sqlite3.connect(db)
+        d.executemany("INSERT OR REPLACE INTO cookies (%s) VALUES (%s)"
+                      % (COLS, ",".join("?" * len(CL))), todo)
+        d.commit()
+        after = d.execute("SELECT count(*) FROM cookies").fetchone()[0]
+        pn1, ph1 = protected_fingerprint(d, cfg["protect"])
+        d.close()
+
+        if (pn0, ph0) != (pn1, ph1):
+            shutil.copy2(backup, db)
+            print("  %s: ABORT — protected rows changed (%s → %s); RESTORED from backup"
+                  % (dst, ph0, ph1))
+            rc = 2; continue
+
+        prune_backups(db, cfg["keep_backups"])
+        state[dst] = time.time()
+        print("  %s: wrote %d rows, %d → %d cookies; %d protected rows verified unchanged"
+              % (dst, len(todo), before, after, pn0))
+
+    if not args.dry_run:
+        save_state(state)
+
+    # A target that is always open in Chrome is always skipped, and a job that
+    # never runs looks exactly like one with nothing to do. Say so out loud.
+    now = time.time()
+    for t in cfg["targets"]:
+        last = state.get(t)
+        if last is None:
+            print("  WARNING: %s has never been grafted" % t); rc = max(rc, 1)
+        elif (now - last) > cfg["stale_days"] * 86400:
+            print("  WARNING: %s last grafted %.1f days ago — open in Chrome every run?"
+                  % (t, (now - last) / 86400)); rc = max(rc, 1)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

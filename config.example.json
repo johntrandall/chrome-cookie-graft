@@ -1,0 +1,23 @@
+{
+  "source": "Default",
+  "targets": ["Profile 1", "Profile 2"],
+
+  "only": [],
+
+  "protect": [
+    "claude.ai", "*.claude.ai",
+    "claude.com", "*.claude.com",
+    "anthropic.com", "*.anthropic.com",
+    "chrome-extension://*"
+  ],
+
+  "exclude": [
+    "*google.com", "*google.com.*", "*youtube.com", "*gstatic.com", "*googleapis.com",
+    "*doubleclick*", "*rubiconproject*", "*adnxs*", "*criteo*", "*pubmatic*",
+    "*taboola*", "*scorecardresearch*", "*contextweb*", "*smaato*",
+    "*adsrvr*", "*casalemedia*", "*openx.net", "*bidswitch*"
+  ],
+
+  "stale_days": 3,
+  "keep_backups": 5
+}
