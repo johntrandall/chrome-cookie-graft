@@ -14,6 +14,10 @@ another on the same machine. Nothing is decrypted here and no Keychain access is
 needed. Only <Profile>/Cookies is ever opened.
 
 Config: ~/.config/chrome-cookie-graft/config.json  (see config.example.json)
+
+Exit codes: 0 = ran (skipping a profile that is open in Chrome is normal),
+1 = a target has gone stale_days without a successful graft, 2 = a protected-row
+change was detected and that target was restored from backup.
 """
 from __future__ import annotations
 
@@ -210,9 +214,10 @@ def main():
     for dst in cfg["targets"]:
         db = cookie_db(dst, base)
         if not db:
-            print("  %s: SKIP — no Cookies DB" % dst); rc = max(rc, 1); continue
+            print("  %s: SKIP — no Cookies DB" % dst); continue
         if is_locked(db):
-            print("  %s: SKIP — open in Chrome (close it and re-run)" % dst); rc = max(rc, 1); continue
+            # Expected, not a failure: the profile is simply in use right now.
+            print("  %s: SKIP — open in Chrome (close it and re-run)" % dst); continue
 
         d = sqlite3.connect(db)
         before = d.execute("SELECT count(*) FROM cookies").fetchone()[0]
@@ -262,8 +267,9 @@ def main():
     for t in cfg["targets"]:
         last = state.get(t)
         if last is None:
-            print("  WARNING: %s has never been grafted" % t); rc = max(rc, 1)
+            print("  NOTE: %s has not been grafted yet" % t)
         elif (now - last) > cfg["stale_days"] * 86400:
+            # This one IS a problem: the job keeps running and never lands.
             print("  WARNING: %s last grafted %.1f days ago — open in Chrome every run?"
                   % (t, (now - last) / 86400)); rc = max(rc, 1)
     return rc
