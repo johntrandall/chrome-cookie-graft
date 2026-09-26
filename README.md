@@ -11,37 +11,52 @@ same service. This tool copies the jar without copying that.
 
 ## Why you'd want this
 
-You keep several Chrome profiles on one Mac, and you want them to share your
-logins — but not *all* of them.
+**The case this was built for: running several Claude accounts side by side in
+one browser.**
 
-The motivating case is **running more than one account on the same service**.
-Chrome's per-profile cookie isolation is what makes that possible, so you cannot
-simply merge the jars. But that same isolation also means every profile starts
-logged out of the several hundred *other* sites you use, and logging back in
-profile-by-profile is not realistic.
+Each Claude subscription needs its own Chrome profile, because claude.ai
+identifies you by cookie — two profiles sharing a cookie jar are the *same*
+Claude account, not two. So you end up with one profile per subscription.
 
-Concretely, this was written for driving browser automation across a set of
-profiles that each hold a different account on one service, where:
+The problem is everything else. Chrome Sync never syncs cookies, so each of
+those profiles starts signed out of every other site you use — your email, your
+bank, your vendor portals, the hundreds you never think about. Logging all of
+them back in, per profile, is not realistic. And you cannot fix it by merging
+the cookie jars, because that isolation is exactly what keeps the Claude
+accounts separate.
 
-- each profile must stay signed in as **its own** account on that service, and
-- every profile should already be signed in to everything **else** — your email,
-  your bank, your vendor portals, the hundred sites you never think about.
+This tool resolves the conflict by copying **everything except** the hosts that
+establish identity:
 
-`protect` is the whole point: those identity-defining hosts are never copied, in
-either direction, and the tool verifies afterwards that they did not move. The
-rest of the jar is shared.
+- `claude.ai`, `claude.com`, `anthropic.com` go in `protect` — **never copied,
+  in either direction**. Each profile stays signed in as its own Claude account.
+- Everything else is copied, so every profile is already signed in to the rest
+  of your web.
 
-Other situations with the same shape:
+The result is several Claude instances, each authenticated as a different
+subscription, all sitting on the same logged-in browser state. That matters most
+when the Claude instances are *driving* the browser: an agent working in one
+profile has your real sessions available, without any risk of it acting as —
+or logging you out of — the account belonging to another profile.
 
-- **Work and personal profiles** that should share your general logins while
-  keeping separate accounts on the one or two services that matter.
+`protect` is enforced, not advisory. Each target's protected rows are SHA-256
+fingerprinted before and after every run; if any of them changed, that profile
+is restored from its backup and the run exits non-zero.
+
+### The same shape, other services
+
+Nothing here is Claude-specific — `protect` takes any host list. The pattern
+fits whenever profiles must hold **different accounts on one service** while
+sharing everything else:
+
+- Two accounts on the same SaaS tool, cloud console, or ad platform.
+- **Work and personal profiles** that should share general logins while keeping
+  separate accounts on the one or two services that matter.
 - **A fresh profile** you want usable immediately, without a day of re-logins.
-- **Testing profiles** that need a realistic logged-in state but must never
-  touch your real account on the system under test.
+- **Testing profiles** needing realistic logged-in state that must never touch
+  your real account on the system under test.
 
-If you only need one profile signed in, you do not need this. If you have never
-hit the "I am logged out again in this profile" problem, you do not need this
-either.
+If you only run one profile, you do not need this.
 
 ## How it works
 
