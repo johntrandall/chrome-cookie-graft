@@ -30,6 +30,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 
 CHROME_DIR = os.path.expanduser("~/Library/Application Support/Google/Chrome")
@@ -177,12 +178,27 @@ def main():
         sys.exit("No Cookies DB for source profile %r" % cfg["source"])
 
     # Snapshot the source; never open the live file for write.
-    snap = "/tmp/cookie-graft-src-%d.db" % os.getpid()
-    shutil.copy2(src_db, snap)
-    s = sqlite3.connect(snap)
-    allrows = s.execute("SELECT %s FROM cookies" % COLS).fetchall()
-    s.close()
-    os.unlink(snap)
+    #
+    # Stage in the per-user temp dir, never shared /tmp. mkstemp uses
+    # O_CREAT|O_EXCL|O_NOFOLLOW and creates the file 0600 before any bytes land.
+    # The old "/tmp/cookie-graft-src-%d.db" % os.getpid() was guessable -- PID is
+    # the only variable -- and /private/tmp is mode 1777, so any other local
+    # account could pre-plant the path and read the snapshot out of its own fd.
+    # shutil.copy2 opens the destination with neither O_EXCL nor O_NOFOLLOW, and
+    # its copymode() restores 0600 only AFTER writing. Not a race: pre-planted
+    # files persist, and this runs daily under launchd.
+    # try/finally additionally guarantees unlink if sqlite raises below.
+    fd, snap = tempfile.mkstemp(prefix="cookie-graft-src-", suffix=".db")
+    os.close(fd)
+    try:
+        shutil.copy2(src_db, snap)
+        s = sqlite3.connect(snap)
+        try:
+            allrows = s.execute("SELECT %s FROM cookies" % COLS).fetchall()
+        finally:
+            s.close()
+    finally:
+        os.unlink(snap)
 
     # Selection order matters: protect ALWAYS wins, even over an explicit `only`
     # allowlist. An allowlist must never be able to un-protect an identity host.
