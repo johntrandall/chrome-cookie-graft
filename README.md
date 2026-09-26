@@ -9,6 +9,40 @@ so every login has to be repeated per profile. That isolation is often
 *load-bearing*: it is what lets several profiles hold several accounts for the
 same service. This tool copies the jar without copying that.
 
+## Why you'd want this
+
+You keep several Chrome profiles on one Mac, and you want them to share your
+logins — but not *all* of them.
+
+The motivating case is **running more than one account on the same service**.
+Chrome's per-profile cookie isolation is what makes that possible, so you cannot
+simply merge the jars. But that same isolation also means every profile starts
+logged out of the several hundred *other* sites you use, and logging back in
+profile-by-profile is not realistic.
+
+Concretely, this was written for driving browser automation across a set of
+profiles that each hold a different account on one service, where:
+
+- each profile must stay signed in as **its own** account on that service, and
+- every profile should already be signed in to everything **else** — your email,
+  your bank, your vendor portals, the hundred sites you never think about.
+
+`protect` is the whole point: those identity-defining hosts are never copied, in
+either direction, and the tool verifies afterwards that they did not move. The
+rest of the jar is shared.
+
+Other situations with the same shape:
+
+- **Work and personal profiles** that should share your general logins while
+  keeping separate accounts on the one or two services that matter.
+- **A fresh profile** you want usable immediately, without a day of re-logins.
+- **Testing profiles** that need a realistic logged-in state but must never
+  touch your real account on the system under test.
+
+If you only need one profile signed in, you do not need this. If you have never
+hit the "I am logged out again in this profile" problem, you do not need this
+either.
+
 ## How it works
 
 Cookies are copied as **ciphertext**. Chrome's `Chrome Safe Storage` Keychain key

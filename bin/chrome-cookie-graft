@@ -109,7 +109,10 @@ def cookie_db(profile, base=None):
 def is_locked(path):
     """True if Chrome currently has this profile loaded. Writing under a loaded
     profile is pointless: Chrome flushes its in-memory jar over us on exit."""
-    return subprocess.run(["lsof", path], capture_output=True).returncode == 0
+    # Absolute path: a bare "lsof" resolves via PATH, which another local account
+    # or a stray shell profile could prepend to. Same multi-user threat model as
+    # the snapshot staging below. macOS-only tool, so /usr/sbin/lsof is stable.
+    return subprocess.run(["/usr/sbin/lsof", path], capture_output=True).returncode == 0
 
 
 def protected_rows(conn, protect):
