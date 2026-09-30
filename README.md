@@ -70,7 +70,7 @@ state, localStorage and IndexedDB are out of reach by construction.
 
 ```sh
 brew install johntrandall/tap/chrome-cookie-graft
-brew services start chrome-cookie-graft      # optional: daily run
+brew services start chrome-cookie-graft      # optional: every 5 min, debounced by min_interval_minutes
 ```
 
 ## Configure
@@ -86,6 +86,7 @@ brew services start chrome-cookie-graft      # optional: daily run
 | `exclude` | Skipped when `only` is empty |
 | `stale_days` | Warn if a target has not been grafted in this long |
 | `keep_backups` | Timestamped `.bak-` files kept per target |
+| `min_interval_minutes` | Skip a target grafted within this many minutes (0 = off). With a frequent schedule, this is what keeps runs cheap. `--force` ignores it |
 
 Profile directory names are not display names. `chrome://version` shows the
 active one as *Profile Path*.
@@ -115,7 +116,13 @@ chrome-cookie-graft --print-config        # effective config after overrides
 
 - **A target open in Chrome is skipped.** Chrome keeps its own in-memory jar and
   flushes it on exit, so a write underneath a loaded profile is silently lost.
-  Close the profile's windows and re-run. Exit 1 means at least one skip.
+  Chrome keeps **every** profile it has loaded open until the whole app quits;
+  closing a profile's windows is not enough. A skip is normal and exits 0.
+- **Run it often, debounce it.** Because Chrome is rarely fully quit, the
+  intended schedule is every 5 minutes with `min_interval_minutes: 60`. Each run
+  decides eligibility (not recently grafted, not open) *before* snapshotting the
+  source, so a run with nothing to do costs one `lsof` per target and prints one
+  line.
 - **Newer-only.** A source row never replaces a destination row that is already
   same-or-newer, so a re-run cannot downgrade a live session.
 - **Staleness warnings.** A profile you always keep open would otherwise be

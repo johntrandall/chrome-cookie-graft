@@ -15,6 +15,12 @@ needed. Only <Profile>/Cookies is ever opened.
 
 Config: ~/.config/chrome-cookie-graft/config.json  (see config.example.json)
 
+Scheduling: designed to be launched often (every 5 minutes) with
+`min_interval_minutes` set (e.g. 60). Each run skips targets grafted within that
+window and targets Chrome has open, and only snapshots the source when at least
+one target is eligible -- so frequent runs are cheap and the job catches the rare
+moments when Chrome is fully quit.
+
 Exit codes: 0 = ran (skipping a profile that is open in Chrome is normal),
 1 = a target has gone stale_days without a successful graft, 2 = a protected-row
 change was detected and that target was restored from backup.
@@ -54,6 +60,7 @@ DEFAULTS = {
     "exclude": [],
     "stale_days": 3,
     "keep_backups": 5,
+    "min_interval_minutes": 0,
 }
 
 
@@ -162,7 +169,13 @@ def main():
                     help="overwrite destination rows even when newer (default: newer-only)")
     ap.add_argument("--chrome-dir", help="override Chrome data dir (testing)")
     ap.add_argument("--print-config", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="ignore min_interval_minutes (graft even if grafted recently)")
+    ap.add_argument("--state", default=None, help="override state file path (testing)")
     args = ap.parse_args()
+    global STATE
+    if args.state:
+        STATE = args.state
 
     cfg = load_config(args.config)
     if args.source:
@@ -176,6 +189,36 @@ def main():
         return 0
 
     base = args.chrome_dir
+    state = load_state()
+    now = time.time()
+    window = 0 if args.force else cfg["min_interval_minutes"] * 60
+
+    # Decide eligibility BEFORE touching the source: a frequent schedule must not
+    # copy the whole source jar every few minutes just to skip every target.
+    eligible, missing, locked, debounced = [], [], [], []
+    for dst in cfg["targets"]:
+        db = cookie_db(dst, base)
+        if not db:
+            missing.append(dst)
+        elif window and (now - state.get(dst, 0)) < window:
+            debounced.append(dst)
+        elif is_locked(db):
+            # Expected, not a failure: the profile is simply in use right now.
+            locked.append(dst)
+        else:
+            eligible.append(dst)
+
+    if not eligible:
+        parts = []
+        if locked:
+            parts.append("open in Chrome: " + ", ".join(locked))
+        if debounced:
+            parts.append("grafted <%dm ago: %s" % (cfg["min_interval_minutes"], ", ".join(debounced)))
+        if missing:
+            parts.append("no Cookies DB: " + ", ".join(missing))
+        print("%s nothing eligible (%s)" % (time.strftime("%Y-%m-%d %H:%M"), "; ".join(parts)))
+        return stale_check(cfg, state, now)
+
     src_db = cookie_db(cfg["source"], base)
     if not src_db:
         sys.exit("No Cookies DB for source profile %r" % cfg["source"])
@@ -223,20 +266,23 @@ def main():
         sys.exit("ABORT: protected hosts present in selection: %s" % leaked)
 
     mode = ("only %s" % cfg["only"]) if cfg["only"] else "all but exclude list"
-    print("source %s: %d cookies / %d hosts selected (%s)"
-          % (cfg["source"], len(rows), len({r[1] for r in rows}), mode))
+    print("%s source %s: %d cookies / %d hosts selected (%s)"
+          % (time.strftime("%Y-%m-%d %H:%M"), cfg["source"], len(rows), len({r[1] for r in rows}), mode))
 
     ki = [CL.index(c) for c in KEY_COLS]
     lui = CL.index("last_update_utc")
-    rc, state = 0, load_state()
+    rc = 0
+    for dst in missing:
+        print("  %s: SKIP — no Cookies DB" % dst)
+    for dst in locked:
+        print("  %s: SKIP — open in Chrome" % dst)
+    for dst in debounced:
+        print("  %s: SKIP — grafted within %d min (--force to override)" % (dst, cfg["min_interval_minutes"]))
 
-    for dst in cfg["targets"]:
+    for dst in eligible:
         db = cookie_db(dst, base)
-        if not db:
-            print("  %s: SKIP — no Cookies DB" % dst); continue
-        if is_locked(db):
-            # Expected, not a failure: the profile is simply in use right now.
-            print("  %s: SKIP — open in Chrome (close it and re-run)" % dst); continue
+        if is_locked(db):  # re-check: Chrome may have opened it since
+            print("  %s: SKIP — open in Chrome" % dst); continue
 
         d = sqlite3.connect(db)
         before = d.execute("SELECT count(*) FROM cookies").fetchone()[0]
@@ -279,10 +325,13 @@ def main():
 
     if not args.dry_run:
         save_state(state)
+    return max(rc, stale_check(cfg, state, time.time()))
 
+
+def stale_check(cfg, state, now):
     # A target that is always open in Chrome is always skipped, and a job that
     # never runs looks exactly like one with nothing to do. Say so out loud.
-    now = time.time()
+    rc = 0
     for t in cfg["targets"]:
         last = state.get(t)
         if last is None:

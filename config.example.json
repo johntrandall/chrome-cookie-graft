@@ -19,5 +19,6 @@
   ],
 
   "stale_days": 3,
-  "keep_backups": 5
+  "keep_backups": 5,
+  "min_interval_minutes": 60
 }
